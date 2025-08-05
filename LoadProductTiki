@@ -1,0 +1,86 @@
+import pandas as pd
+import requests
+import json
+import os
+import time
+from datetime import datetime
+import asyncio
+import httpx
+from more_itertools import chunked
+
+# === Cấu hình ===
+EXCEL_FILE = r"D:\MDM\Unigap\Project\Project2\products_id.xlsx"
+SHEET_NAME = 'in'
+COLUMN_ID = 'id'
+LINES_PER_FILE = 1000
+API_URL_TEMPLATE = "https://api.tiki.vn/product-detail/api/v1/products/{}"
+OUTPUT_FOLDER = "output"
+
+# Tạo thư mục nếu chưa có
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+headers = {
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json; charset=utf-8'
+}
+
+async def fetch_product_data(client, product_id):
+    url = API_URL_TEMPLATE.format(product_id)
+    try:
+        response = await client.get(url, timeout=5)
+        if response.status_code == 200:
+            data =  response.json()
+            print(f"Fetched {product_id}")
+            return {
+                "id": data.get("id"),
+                "name": data.get("name"),
+                "price": data.get("price"),
+                "url_key": data.get("url_key"),
+                "description": data.get("description"),
+                "images": data.get("images")
+            }
+        else:
+            print(f"Lỗi API với ID {product_id} – {response.status_code}")
+    except Exception as e:
+        print(f"Lỗi kết nối với ID {product_id}: {e}")
+    return None
+
+async def main():
+    df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME)
+    ids = df[COLUMN_ID].dropna().astype(str).tolist()
+    so_phan_tu = len(ids)
+    batch_data = []
+    file_index = 1
+    async with httpx.AsyncClient(headers=headers) as client:
+        batch_size = 50
+        for i, id_batch in enumerate(chunked(ids, batch_size), 1):
+            print(f"Batch {i}: đang gọi {len(id_batch)} IDs")
+            tasks = [fetch_product_data(client, pid) for pid in id_batch]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in responses:
+                if isinstance(res, dict):
+                    batch_data.append(res)
+                    if len(batch_data) >= LINES_PER_FILE:
+                        file_path = os.path.join(OUTPUT_FOLDER, f"data_{file_index}.json")
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            json.dump(batch_data, f, indent=4, ensure_ascii=False)
+                        print(f"Đã lưu {LINES_PER_FILE} dòng vào {file_path}")
+                        batch_data = []
+                        file_index += 1
+
+    # Lưu phần còn lại
+    if batch_data:
+        file_path = os.path.join(OUTPUT_FOLDER, f"data_{file_index}.json")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(batch_data, f, indent=4, ensure_ascii=False)
+        print(f"Đã lưu {len(batch_data)} dòng cuối vào {file_path}")
+
+    print(f"Tổng product thành công: {LINES_PER_FILE * (file_index - 1) + len(batch_data)}")
+    print(f"Tổng product lỗi: {so_phan_tu - (LINES_PER_FILE * (file_index - 1) + len(batch_data))}")
+
+if __name__ == "__main__":
+    start1 = datetime.now()
+    print(f"Bắt đầu lúc: {start1}")
+    asyncio.run(main())
+    end1 = datetime.now()
+    print(f"Hoàn thành sau: {end1 - start1}")
