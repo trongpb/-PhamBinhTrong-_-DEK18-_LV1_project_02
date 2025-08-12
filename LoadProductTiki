@@ -1,86 +1,245 @@
 import pandas as pd
-import requests
 import json
 import os
-import time
-from datetime import datetime
 import asyncio
 import httpx
+from datetime import datetime
+from bs4 import BeautifulSoup
+import re
+from tenacity import retry, stop_after_attempt, wait_exponential
 from more_itertools import chunked
-
-# === Cấu hình ===
-EXCEL_FILE = r"D:\MDM\Unigap\Project\Project2\products_id.xlsx"
-SHEET_NAME = 'in'
+import time
+import subprocess
+from sys import argv, executable
+# Solutuion:
+# 1.Lưu mỗi file với 1000 ids, và phần còn lại vào file cuối
+# 2.Retry để đảm bảo không bỏ sót
+# 3.Check point để chạy tiếp tục khi bị lỗi ( thủ công)
+# 4.Proxy và cookies: chưa tạo được vì ko có proxy free cho giao thức https
+# 5.Clean Description
+# 6.Xử lý trong 1 file không bị trùng product ID
+# 7.Chạy tự động khi bị lỗi
+# ========= CONFIG ==========
+EXCEL_FILE = r"../input/products_id.xlsx"
+SHEET_NAME = 'goc'
 COLUMN_ID = 'id'
 LINES_PER_FILE = 1000
 API_URL_TEMPLATE = "https://api.tiki.vn/product-detail/api/v1/products/{}"
-OUTPUT_FOLDER = "output"
+OUTPUT_FOLDER = "../output"
+LOG_FOLDER = "../logs"
+CHECKPOINT_FILE = os.path.join(OUTPUT_FOLDER, "checkpoint.json")
+path_fail_file = os.path.join(LOG_FOLDER, "failed_ids.log")
+INDEX_FILE = os.path.join(OUTPUT_FOLDER, "file_index.txt")
+BATCH_SIZE = 100
+SEM_LIMIT = 50
+# ===========================
 
-# Tạo thư mục nếu chưa có
+
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(LOG_FOLDER, exist_ok=True)
 
 headers = {
     'User-Agent': 'Mozilla/5.0',
     'Accept': 'application/json; charset=utf-8'
 }
 
-async def fetch_product_data(client, product_id):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_product_data(client, product_id, sem):
     url = API_URL_TEMPLATE.format(product_id)
-    try:
-        response = await client.get(url, timeout=5)
-        if response.status_code == 200:
-            data =  response.json()
-            print(f"Fetched {product_id}")
-            return {
-                "id": data.get("id"),
-                "name": data.get("name"),
-                "price": data.get("price"),
-                "url_key": data.get("url_key"),
-                "description": data.get("description"),
-                "images": data.get("images")
-            }
-        else:
-            print(f"Lỗi API với ID {product_id} – {response.status_code}")
-    except Exception as e:
-        print(f"Lỗi kết nối với ID {product_id}: {e}")
-    return None
+    async with sem:
+        try:
+            response = await client.get(url, timeout=5)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except Exception as e:
+                    print(f"❌ Không thể parse JSON cho ID {product_id}: {e}")
+                    print(f"↪ Nội dung trả về: {response.text[:200]}")
+                    raise
+
+                print(f"✅ {product_id}")
+                return {
+                    "id": data.get("id"),
+                    "name": data.get("name"),
+                    "price": data.get("price"),
+                    "url_key": data.get("url_key"),
+                    "description": clean_description(data.get("description")),
+                    "images": data.get("images")
+                }
+            else:
+                print(f"⚠️ Lỗi {response.status_code} – ID: {product_id}")
+                raise Exception(f"HTTP {response.status_code}")
+        except Exception as e:
+            print(f"❌ Lỗi ID {product_id}: {e}")
+            raise
+
+
+def write_json(data, path):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+async def save_to_file(data, file_index):
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    file_path = os.path.join(OUTPUT_FOLDER, f"data_{today_str}_{file_index:03d}.json")
+    await asyncio.to_thread(write_json, data, file_path)
+    print(f"💾 Đã lưu {len(data)} dòng vào {file_path}")
+
+def save_to_file_index(file_index):
+    with open(INDEX_FILE, "w") as f:
+        f.write(str(file_index))
+
+def load_file_index():
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, 'r') as f:
+            return int(f.read().strip())
+    return 1
+
+def save_checkpoint(done_ids):
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(list(done_ids), f)
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return set(json.load(f))
+    return set()
+def load_failed_ids():
+    if os.path.exists(path_fail_file):
+        with open(path_fail_file, 'r') as f:
+            return set(json.load(f))
+    return set()
+
+
+def clean_description(raw_html):
+    soup = BeautifulSoup(raw_html or "", "html.parser")
+    for ul in soup.find_all('ul'):
+        new_ul = soup.new_tag('ul')
+        for p in ul.find_all('p'):
+            li = soup.new_tag('li')
+            li.string = p.get_text(strip=True)
+            new_ul.append(li)
+        ul.replace_with(new_ul)
+
+    for tag in soup.find_all(['span', 'strong']):
+        tag.unwrap()
+
+    for tag in soup.find_all():
+        if tag.name not in ['p', 'ul', 'li', 'br', 'img'] and not tag.get_text(strip=True):
+            tag.decompose()
+
+    clean_text = re.sub(r'\s+', ' ', soup.prettify())
+    return clean_text.strip()
 
 async def main():
     df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME)
     ids = df[COLUMN_ID].dropna().astype(str).tolist()
+    done_ids = load_checkpoint()
+    remaining_ids = [pid for pid in ids if pid not in done_ids]
+
+
     so_phan_tu = len(ids)
+
+    sem = asyncio.Semaphore(SEM_LIMIT)
     batch_data = []
-    file_index = 1
+    existing_ids = set()
+    file_index = load_file_index() # nếu bị dừng và chạy lại thì đánh số file tiếp tục, không chạy đè lên file cũ
+    failed_ids = []
+
     async with httpx.AsyncClient(headers=headers) as client:
-        batch_size = 50
-        for i, id_batch in enumerate(chunked(ids, batch_size), 1):
-            print(f"Batch {i}: đang gọi {len(id_batch)} IDs")
-            tasks = [fetch_product_data(client, pid) for pid in id_batch]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in responses:
+        for chunk in chunked(remaining_ids, BATCH_SIZE):
+            print(f"🚀 Đang xử lý batch {chunk[0]} đến {chunk[-1]}")
+            tasks = [fetch_product_data(client, pid, sem) for pid in chunk]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, res in enumerate(results):
+                pid = chunk[i]
                 if isinstance(res, dict):
-                    batch_data.append(res)
+                    if res["id"] not in existing_ids:
+                        batch_data.append(res)
+                        existing_ids.add(res["id"])
+                        done_ids.add(pid)
+
                     if len(batch_data) >= LINES_PER_FILE:
-                        file_path = os.path.join(OUTPUT_FOLDER, f"data_{file_index}.json")
-                        with open(file_path, 'w', encoding='utf-8') as f:
-                            json.dump(batch_data, f, indent=4, ensure_ascii=False)
-                        print(f"Đã lưu {LINES_PER_FILE} dòng vào {file_path}")
-                        batch_data = []
+                        await save_to_file(batch_data, file_index)
                         file_index += 1
+                        save_checkpoint(done_ids)
+                        save_to_file_index(file_index)
+                        batch_data = []
+                        existing_ids = set()
+                else:
+                    failed_ids.append(pid)
 
-    # Lưu phần còn lại
-    if batch_data:
-        file_path = os.path.join(OUTPUT_FOLDER, f"data_{file_index}.json")
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(batch_data, f, indent=4, ensure_ascii=False)
-        print(f"Đã lưu {len(batch_data)} dòng cuối vào {file_path}")
+        # Lưu phần còn lại 1
+        if batch_data:
+            await save_to_file(batch_data, file_index)
+            save_checkpoint(done_ids)
+            save_to_file_index(file_index)
 
-    print(f"Tổng product thành công: {LINES_PER_FILE * (file_index - 1) + len(batch_data)}")
-    print(f"Tổng product lỗi: {so_phan_tu - (LINES_PER_FILE * (file_index - 1) + len(batch_data))}")
+        # Ghi lỗi lần 1
+        if failed_ids:
+            log_path = os.path.join(LOG_FOLDER, "failed_ids.log")
+            with open(log_path, 'w', encoding='utf-8') as f:
+                   json.dump(list(failed_ids), f)
+
+
+        fail_ids = load_failed_ids()
+        retry_fail_ids = [pid for pid in fail_ids]
+        print(retry_fail_ids)
+        failed_ids.clear()
+        # lần 2 chạy trên file log
+        async with httpx.AsyncClient(headers=headers) as client:
+            for chunk in chunked(retry_fail_ids, BATCH_SIZE):
+                print(f"🚀 Đang xử lý batch {chunk[0]} đến {chunk[-1]}")
+                tasks = [fetch_product_data(client, pid, sem) for pid in chunk]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for i, res in enumerate(results):
+                    pid = chunk[i]
+                    if isinstance(res, dict):
+                        if res["id"] not in existing_ids:
+                            batch_data.append(res)
+                            existing_ids.add(res["id"])
+                            done_ids.add(pid)
+
+                        if len(batch_data) >= LINES_PER_FILE:
+                            await save_to_file(batch_data, file_index)
+                            file_index += 1
+                            save_checkpoint(done_ids)
+                            save_to_file_index(file_index)
+                            batch_data = []
+                            existing_ids = set()
+                    else:
+                        failed_ids.append(pid)
+
+            # Lưu phần còn lại 2
+            if batch_data:
+                await save_to_file(batch_data, file_index)
+                save_checkpoint(done_ids)
+                save_to_file_index(file_index)
+                # Ghi lỗi lần 2
+            if failed_ids:
+                log_path = os.path.join(LOG_FOLDER, "failed_ids.log")
+                with open(log_path, 'w', encoding='utf-8') as f:
+                    for pid in failed_ids:
+                        f.write(f"{pid}\n")
+                print(f"📄 Ghi {len(failed_ids)} ID lỗi vào {log_path}")
+    def restart_script():
+        print("🔁 Đang khởi động lại script...")
+        time.sleep(5)
+        os.execv(executable, ['python'] + argv)
+
+    total_success = len(done_ids)
+    print(f"\n✅ Tổng thành công: {total_success}")
+    print(f"❌ Tổng lỗi: {so_phan_tu - total_success}")
 
 if __name__ == "__main__":
-    start1 = datetime.now()
-    print(f"Bắt đầu lúc: {start1}")
-    asyncio.run(main())
-    end1 = datetime.now()
-    print(f"Hoàn thành sau: {end1 - start1}")
+
+        try:
+            start1 = datetime.now()
+            asyncio.run(main())
+            end1 = datetime.now()
+            print(f"Bắt đầu lúc: {start1}")
+            print(f"Hoàn thành sau: {end1 - start1}")
+        except Exception as e:
+            print(f"❌ Chương trình lỗi: {e}")
+
